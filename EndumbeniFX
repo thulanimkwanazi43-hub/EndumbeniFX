@@ -1,0 +1,1058 @@
+import os
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import Dict, List
+
+import requests
+import yfinance as yf
+import websocket
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+# ----------------------------
+# Configuration
+# ----------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "alpha_market_private_final.db"
+APP_NAME = "Alpha Market Agent"
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+
+ASSET_UNIVERSE = {
+    "EURUSD": "OANDA:EUR_USD",
+    "GBPUSD": "OANDA:GBP_USD",
+    "GBPJPY": "OANDA:GBP_JPY",
+    "EURJPY": "OANDA:EUR_JPY",
+    "USDCAD": "OANDA:USD_CAD",
+    "XAUUSD": "TVC:GOLD",
+    "NAS100": "NASDAQ:NDX",
+    "US30": "NASDAQ:DJI",
+    "GER40": "DEUTSCHE_BOERSE:DAX",
+}
+
+# ----------------------------
+# Database
+# ----------------------------
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            score REAL NOT NULL,
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            risk REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            score REAL NOT NULL,
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL,
+            pnl REAL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    conn.execute("""
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('app_name', 'Alpha Market Agent')
+    """)
+
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# ATR
+# ----------------------------
+def calculate_atr(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 0.0
+
+    tr_values = []
+    for i in range(1, len(closes)):
+        current = closes[i]
+        prev = closes[i - 1]
+        high = max(current, prev)
+        low = min(current, prev)
+        true_range = high - low
+        tr_values.append(true_range)
+
+    if not tr_values:
+        return 0.0
+
+    atr = sum(tr_values[-period:]) / period
+    return max(atr, 1e-6)
+
+# ----------------------------
+# Market data
+# ----------------------------
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+def _resample_h4_from_h1(values):
+    resampled = []
+    for i in range(0, len(values) - 3, 4):
+        block = values[i:i+4]
+        if len(block) == 4:
+            resampled.append(sum(block) / 4)
+    return resampled
+
+def _fetch_finnhub_candles(symbol: str, resolution: str, days_back: int):
+    if not FINNHUB_API_KEY:
+        return {"error": "No Finnhub key"}
+
+    from_ts = int(time.time()) - (days_back * 24 * 60 * 60)
+    to_ts = int(time.time())
+
+    url = f"{FINNHUB_BASE}/stock/candle"
+    params = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "from": from_ts,
+        "to": to_ts,
+        "token": FINNHUB_API_KEY,
+    }
+
+    response = requests.get(url, params=params, timeout=15)
+    if response.status_code != 200:
+        return {"error": f"HTTP {response.status_code}"}
+
+    data = response.json()
+    if data.get("s") != "ok":
+        return {"error": data}
+
+    closes = data.get("c", [])
+    timestamps = data.get("t", [])
+
+    return {
+        "labels": [str(ts) for ts in timestamps],
+        "values": [float(v) for v in closes],
+    }
+
+def _fetch_yahoo_fallback(symbol: str):
+    ticker = ASSET_UNIVERSE.get(symbol)
+    if not ticker:
+        return {"error": "No mapping"}
+
+    try:
+        data = yf.download(ticker, period="1mo", interval="1h", progress=False, auto_adjust=False)
+        if data.empty:
+            return {"error": "No data"}
+
+        closes = [float(v) for v in data["Close"].tail(200).tolist()]
+        labels = [str(index) for index in data["Close"].tail(200).index]
+        return {"labels": labels, "values": closes}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+def fetch_symbol_data(symbol: str) -> Dict:
+    provider_symbol = ASSET_UNIVERSE.get(symbol)
+    if not provider_symbol:
+        return {"symbol": symbol, "error": "No symbol mapping"}
+
+    if FINNHUB_API_KEY:
+        h1 = _fetch_finnhub_candles(provider_symbol, resolution="60", days_back=90)
+        m15 = _fetch_finnhub_candles(provider_symbol, resolution="15", days_back=30)
+        m5 = _fetch_finnhub_candles(provider_symbol, resolution="5", days_back=7)
+
+        if "error" not in h1 and "error" not in m15 and "error" not in m5:
+            h1_values = h1.get("values", [])[-200:]
+            m15_values = m15.get("values", [])[-200:]
+            m5_values = m5.get("values", [])[-200:]
+            h4_values = _resample_h4_from_h1(h1_values)
+
+            return {
+                "symbol": symbol,
+                "provider_symbol": provider_symbol,
+                "timeframes": {
+                    "H4": h4_values,
+                    "H1": h1_values,
+                    "M15": m15_values,
+                    "M5": m5_values,
+                },
+                "labels": h1.get("labels", [])[-200:],
+                "values": h1_values,
+            }
+
+    fallback = _fetch_yahoo_fallback(symbol)
+    if "error" in fallback:
+        return {"symbol": symbol, "error": "No data"}
+
+    values = fallback.get("values", [])[-200:]
+    h4_values = _resample_h4_from_h1(values)
+
+    return {
+        "symbol": symbol,
+        "provider_symbol": provider_symbol,
+        "timeframes": {
+            "H4": h4_values,
+            "H1": values,
+            "M15": values[-100:],
+            "M5": values[-50:],
+        },
+        "labels": fallback.get("labels", [])[-200:],
+        "values": values,
+    }
+
+def fetch_market_snapshot() -> Dict[str, Dict]:
+    snapshot = {}
+    for symbol in ASSET_UNIVERSE.keys():
+        snapshot[symbol] = fetch_symbol_data(symbol)
+    return snapshot
+
+# ----------------------------
+# Live websocket feed
+# ----------------------------
+live_store = {}
+
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+    except Exception:
+        return
+
+    if isinstance(data, dict) and "data" in data:
+        for item in data.get("data", []):
+            symbol = item.get("s")
+            price = item.get("p")
+            if symbol and price is not None:
+                live_store[symbol] = float(price)
+
+def on_error(ws, error):
+    print("WebSocket error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed")
+
+def on_open(ws):
+    print("WebSocket connected")
+    for symbol in ASSET_UNIVERSE.values():
+        ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
+
+def start_live_feed():
+    if not FINNHUB_API_KEY:
+        print("No Finnhub key. Live feed disabled.")
+        return
+
+    ws_url = "wss://ws.finnhub.io?token=" + FINNHUB_API_KEY
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+    ws.run_forever()
+
+# ----------------------------
+# Signal engine
+# ----------------------------
+class SignalEngine:
+    def evaluate(self, symbol: str, market_data: Dict) -> Dict:
+        timeframes = market_data.get("timeframes", {})
+        h4 = timeframes.get("H4", [])
+        h1 = timeframes.get("H1", [])
+        m15 = timeframes.get("M15", [])
+        m5 = timeframes.get("M5", [])
+
+        if len(h4) < 20 or len(h1) < 20 or len(m15) < 15 or len(m5) < 10:
+            return {
+                "symbol": symbol,
+                "direction": "FLAT",
+                "score": 0.0,
+                "confidence": 0.0,
+                "status": "SKIPPED",
+                "reason": "insufficient multi-timeframe data",
+                "risk": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "holding_minutes": 0,
+                "max_hold_hours": 0,
+                "atr": 0.0,
+            }
+
+        def trend_strength(values: List[float]) -> float:
+            if len(values) < 20:
+                return 0.0
+            latest = values[-1]
+            ma_slow = sum(values[-20:]) / 20
+            return (latest - ma_slow) / ma_slow
+
+        def momentum_strength(values: List[float]) -> float:
+            if len(values) < 3:
+                return 0.0
+            return (values[-1] - values[-3]) / values[-3]
+
+        h4_trend = trend_strength(h4)
+        h1_trend = trend_strength(h1)
+        m15_trend = trend_strength(m15)
+        m5_trend = trend_strength(m5)
+
+        h4_momentum = momentum_strength(h4)
+        h1_momentum = momentum_strength(h1)
+        m15_momentum = momentum_strength(m15)
+        m5_momentum = momentum_strength(m5)
+
+        score = 0.0
+        confirmation_count = 0
+        reasons = []
+
+        if h4_trend > 0.002:
+            score += 0.35
+            confirmation_count += 1
+            reasons.append("H4 bullish")
+        elif h4_trend < -0.002:
+            score -= 0.35
+            confirmation_count += 1
+            reasons.append("H4 bearish")
+
+        if h1_trend > 0.0012 and h4_trend > 0:
+            score += 0.22
+            confirmation_count += 1
+            reasons.append("H1 confirms uptrend")
+        elif h1_trend < -0.0012 and h4_trend < 0:
+            score -= 0.22
+            confirmation_count += 1
+            reasons.append("H1 confirms downtrend")
+        else:
+            return {
+                "symbol": symbol,
+                "direction": "FLAT",
+                "score": 0.0,
+                "confidence": 0.0,
+                "status": "SKIPPED",
+                "reason": "H4/H1 conflict",
+                "risk": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "holding_minutes": 0,
+                "max_hold_hours": 0,
+                "atr": 0.0,
+            }
+
+        if m15_trend > 0.0008 and m15_momentum > 0:
+            score += 0.18
+            confirmation_count += 1
+            reasons.append("M15 bullish entry")
+        elif m15_trend < -0.0008 and m15_momentum < 0:
+            score -= 0.18
+            confirmation_count += 1
+            reasons.append("M15 bearish entry")
+        else:
+            return {
+                "symbol": symbol,
+                "direction": "FLAT",
+                "score": 0.0,
+                "confidence": 0.0,
+                "status": "SKIPPED",
+                "reason": "M15 entry weak or conflicting",
+                "risk": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "holding_minutes": 0,
+                "max_hold_hours": 0,
+                "atr": 0.0,
+            }
+
+        if m5_trend > 0.0003 and m5_momentum > 0:
+            score += 0.15
+            confirmation_count += 1
+            reasons.append("M5 refinement bullish")
+        elif m5_trend < -0.0003 and m5_momentum < 0:
+            score -= 0.15
+            confirmation_count += 1
+            reasons.append("M5 refinement bearish")
+        else:
+            return {
+                "symbol": symbol,
+                "direction": "FLAT",
+                "score": 0.0,
+                "confidence": 0.0,
+                "status": "SKIPPED",
+                "reason": "M5 confirmation failed",
+                "risk": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "holding_minutes": 0,
+                "max_hold_hours": 0,
+                "atr": 0.0,
+            }
+
+        if h4_trend > 0 and h1_trend > 0 and m15_trend > 0 and m5_trend > 0:
+            score += 0.10
+            reasons.append("full alignment")
+        elif h4_trend < 0 and h1_trend < 0 and m15_trend < 0 and m5_trend < 0:
+            score -= 0.10
+            reasons.append("full alignment")
+
+        if h4_momentum > 0 and h1_momentum > 0 and m15_momentum > 0:
+            score += 0.05
+        elif h4_momentum < 0 and h1_momentum < 0 and m15_momentum < 0:
+            score -= 0.05
+
+        confidence = min(0.99, 0.58 + (confirmation_count * 0.08) + abs(score) * 0.22)
+
+        direction = "FLAT"
+        if score > 0.55 and confidence >= 0.65:
+            direction = "BUY"
+        elif score < -0.55 and confidence >= 0.65:
+            direction = "SELL"
+
+        reason = " • ".join(reasons[:3]) if reasons else "multi-timeframe intraday setup"
+
+        if direction == "FLAT":
+            return {
+                "symbol": symbol,
+                "direction": "FLAT",
+                "score": 0.0,
+                "confidence": 0.0,
+                "status": "SKIPPED",
+                "reason": "low conviction",
+                "risk": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "holding_minutes": 0,
+                "max_hold_hours": 0,
+                "atr": 0.0,
+            }
+
+        latest_price = m5[-1]
+        atr = calculate_atr(m5, period=14)
+        if atr <= 0:
+            atr = 0.0005 * latest_price
+
+        if direction == "BUY":
+            stop_loss = latest_price - atr * 1.2
+            take_profit = latest_price + atr * 2.2
+        else:
+            stop_loss = latest_price + atr * 1.2
+            take_profit = latest_price - atr * 2.2
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "score": round(score, 4),
+            "confidence": round(confidence, 4),
+            "status": "ACTIVE",
+            "reason": reason,
+            "risk": 0.008,
+            "stop_loss": round(stop_loss, 6),
+            "take_profit": round(take_profit, 6),
+            "holding_minutes": 30,
+            "max_hold_hours": 4,
+            "atr": round(atr, 6),
+        }
+
+# ----------------------------
+# Risk manager
+# ----------------------------
+class RiskManager:
+    def __init__(self):
+        self.active_positions = {}
+        self.daily_trade_count = 0
+        self.daily_pnl = 0.0
+
+    def can_trade(self, signal: dict) -> bool:
+        if signal["status"] == "SKIPPED":
+            return False
+
+        if signal["confidence"] < 0.65:
+            return False
+
+        if signal["symbol"] in self.active_positions:
+            return False
+
+        if self.daily_trade_count >= 1:
+            return False
+
+        if self.daily_pnl <= -200:
+            return False
+
+        if signal.get("atr", 0) <= 0:
+            return False
+
+        return True
+
+# ----------------------------
+# Trade service
+# ----------------------------
+class TradeService:
+    def record_trade(self, symbol: str, direction: str, score: float, confidence: float, status: str, pnl: float = 0.0):
+        conn = get_connection()
+        conn.execute("""
+            INSERT INTO trade_history (symbol, direction, score, confidence, status, pnl)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (symbol, direction, score, confidence, status, pnl))
+        conn.commit()
+        conn.close()
+
+    def get_history(self):
+        conn = get_connection()
+        rows = conn.execute("""
+            SELECT symbol, direction, score, confidence, status, pnl, created_at
+            FROM trade_history
+            ORDER BY created_at DESC
+            LIMIT 100
+        """).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI(title=APP_NAME, version="1.0.0")
+
+# serve a single HTML page from this file
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="description" content="Private intraday market specialist dashboard" />
+  <title>Alpha Market Agent</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-alt: #1f2937;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --blue: #38bdf8;
+      --border: rgba(148,163,184,0.2);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, sans-serif;
+      min-height: 100vh;
+    }
+
+    .topbar {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 16px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .eyebrow {
+      margin: 0;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    h1 {
+      margin: 8px 0 18px;
+      font-size: clamp(1.8rem, 3vw, 2.5rem);
+    }
+
+    .dashboard {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 16px 48px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(150px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .card label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .card strong {
+      font-size: clamp(1.2rem, 2vw, 2rem);
+    }
+
+    .signal-list, .history-panel, .chart-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 18px;
+      margin-top: 18px;
+    }
+
+    .signal-list-inner, .history-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .signal-card, .history-item {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .signal-left {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .symbol {
+      font-weight: 700;
+      font-size: 1.1rem;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .badge {
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+    }
+
+    .buy {
+      background: rgba(34,197,94,0.12);
+      color: var(--green);
+      border: 1px solid rgba(34,197,94,0.3);
+    }
+
+    .sell {
+      background: rgba(239,68,68,0.12);
+      color: var(--red);
+      border: 1px solid rgba(239,68,68,0.3);
+    }
+
+    .skip {
+      background: rgba(245,158,11,0.12);
+      color: var(--amber);
+      border: 1px solid rgba(245,158,11,0.3);
+    }
+
+    select {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: #0b1220;
+      color: var(--text);
+      border: 1px solid var(--border);
+      margin-bottom: 12px;
+    }
+
+    button {
+      border: none;
+      border-radius: 12px;
+      padding: 12px 14px;
+      background: linear-gradient(135deg, #2563eb, #38bdf8);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    canvas {
+      width: 100%;
+      max-height: 320px;
+      background: rgba(15, 23, 42, 0.6);
+      border-radius: 12px;
+      margin-top: 10px;
+    }
+
+    @media (max-width: 720px) {
+      .summary-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .signal-card, .history-item {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .topbar {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="appView">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Intraday Market Specialist</p>
+        <h1>Alpha Market Agent</h1>
+      </div>
+      <div class="top-actions">
+        <button id="refreshButton">Refresh</button>
+      </div>
+    </header>
+
+    <main class="dashboard">
+      <section class="summary-grid">
+        <div class="card">
+          <label>Active Positions</label>
+          <strong id="activePositions">0</strong>
+        </div>
+        <div class="card">
+          <label>Daily PnL</label>
+          <strong id="dailyPnl">0.00</strong>
+        </div>
+        <div class="card">
+          <label>Risk State</label>
+          <strong id="riskState">OK</strong>
+        </div>
+      </section>
+
+      <section class="signal-list">
+        <h2>Intraday Signals</h2>
+        <div id="signalList" class="signal-list-inner"></div>
+      </section>
+
+      <section class="history-panel">
+        <h2>Trade History</h2>
+        <div id="historyList" class="history-list"></div>
+      </section>
+
+      <section class="chart-panel">
+        <h2>Chart Explorer</h2>
+        <select id="chartSymbol">
+          <option value="EURUSD">EURUSD</option>
+          <option value="GBPUSD">GBPUSD</option>
+          <option value="GBPJPY">GBPJPY</option>
+          <option value="EURJPY">EURJPY</option>
+          <option value="USDCAD">USDCAD</option>
+          <option value="XAUUSD">XAUUSD</option>
+          <option value="NAS100">NAS100</option>
+          <option value="US30">US30</option>
+          <option value="GER40">GER40</option>
+        </select>
+        <canvas id="marketChart" width="900" height="300"></canvas>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    async function fetchDashboard() {
+      const response = await fetch('/api/dashboard');
+      if (!response.ok) throw new Error('Failed to load dashboard');
+      return response.json();
+    }
+
+    async function fetchHistory() {
+      const response = await fetch('/api/history');
+      if (!response.ok) throw new Error('Failed to load history');
+      return response.json();
+    }
+
+    async function fetchChart(symbol) {
+      const response = await fetch(`/api/chart/${symbol}`);
+      if (!response.ok) throw new Error('Failed to load chart');
+      return response.json();
+    }
+
+    function renderSignals(signals) {
+      const container = document.getElementById('signalList');
+      container.innerHTML = '';
+
+      if (!signals || signals.length === 0) {
+        container.innerHTML = '<p>No signals available.</p>';
+        return;
+      }
+
+      signals.forEach((signal) => {
+        const card = document.createElement('div');
+        card.className = 'signal-card';
+
+        const dirClass =
+          signal.direction === 'BUY' ? 'buy' :
+          signal.direction === 'SELL' ? 'sell' : 'skip';
+
+        card.innerHTML = `
+          <div class="signal-left">
+            <div class="symbol">${signal.symbol}</div>
+            <div class="meta">${signal.reason} • Confidence ${signal.confidence}</div>
+          </div>
+          <div class="badge ${dirClass}">${signal.direction}</div>
+        `;
+
+        container.appendChild(card);
+      });
+    }
+
+    function renderHistory(items) {
+      const container = document.getElementById('historyList');
+      container.innerHTML = '';
+
+      if (!items || items.length === 0) {
+        container.innerHTML = '<p>No history yet.</p>';
+        return;
+      }
+
+      items.forEach((item) => {
+        const row = document.createElement('div');
+        row.className = 'history-item';
+
+        const dirClass =
+          item.direction === 'BUY' ? 'buy' :
+          item.direction === 'SELL' ? 'sell' : 'skip';
+
+        row.innerHTML = `
+          <div>
+            <strong>${item.symbol}</strong>
+            <div class="meta">${item.created_at}</div>
+          </div>
+          <div>
+            <span class="badge ${dirClass}">${item.direction}</span>
+          </div>
+        `;
+        container.appendChild(row);
+      });
+    }
+
+    let chartInstance = null;
+
+    function renderChart(payload) {
+      const ctx = document.getElementById('marketChart').getContext('2d');
+
+      if (chartInstance) {
+        chartInstance.destroy();
+      }
+
+      chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: payload.labels,
+          datasets: [{
+            label: payload.symbol,
+            data: payload.values,
+            borderColor: '#38bdf8',
+            backgroundColor: 'rgba(56,189,248,0.15)',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: true }
+          },
+          scales: {
+            y: { beginAtZero: false }
+          }
+        }
+      });
+    }
+
+    async function loadChart(symbol) {
+      const data = await fetchChart(symbol);
+      renderChart(data);
+    }
+
+    async function refreshDashboard() {
+      const data = await fetchDashboard();
+      document.getElementById('activePositions').textContent = data.active_positions;
+      document.getElementById('dailyPnl').textContent = Number(data.daily_pnl).toFixed(2);
+      document.getElementById('riskState').textContent = data.risk_status;
+      renderSignals(data.signals);
+
+      const history = await fetchHistory();
+      renderHistory(history.items);
+    }
+
+    const chartSymbol = document.getElementById('chartSymbol');
+
+    chartSymbol.addEventListener('change', async (event) => {
+      await loadChart(event.target.value);
+    });
+
+    document.getElementById('refreshButton').addEventListener('click', async () => {
+      await refreshDashboard();
+      await loadChart(chartSymbol.value);
+    });
+
+    refreshDashboard();
+    loadChart(chartSymbol.value);
+    setInterval(refreshDashboard, 15000);
+  </script>
+</body>
+</html>
+"""
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+@app.get("/")
+async def root():
+    return HTMLResponse(INDEX_HTML)
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "service": APP_NAME}
+
+@app.get("/api/dashboard")
+async def dashboard():
+    snapshot = fetch_market_snapshot()
+    signals = []
+
+    for symbol, payload in snapshot.items():
+        if "error" in payload:
+            continue
+
+        signal = signal_engine.evaluate(symbol, payload)
+
+        live_price = live_store.get(symbol)
+        if live_price:
+            signal["live_price"] = live_price
+
+        if risk_manager.can_trade(signal):
+            signal["status"] = "ACTIVE"
+            risk_manager.active_positions[symbol] = signal
+            risk_manager.daily_trade_count += 1
+        else:
+            signal["status"] = "SKIPPED"
+
+        signals.append(signal)
+
+        conn = get_connection()
+        conn.execute("""
+            INSERT INTO signals (symbol, direction, score, confidence, status, reason, risk, stop_loss, take_profit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            signal["symbol"],
+            signal["direction"],
+            signal["score"],
+            signal["confidence"],
+            signal["status"],
+            signal["reason"],
+            signal["risk"],
+            signal["stop_loss"],
+            signal["take_profit"],
+        ))
+        conn.commit()
+        conn.close()
+
+    return {
+        "app_name": APP_NAME,
+        "signals": signals,
+        "active_positions": len(risk_manager.active_positions),
+        "daily_pnl": risk_manager.daily_pnl,
+        "risk_status": "OK" if len(risk_manager.active_positions) < 3 else "LIMITED",
+    }
+
+@app.get("/api/history")
+async def history():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT symbol, direction, score, confidence, status, pnl, created_at
+        FROM trade_history
+        ORDER BY created_at DESC
+        LIMIT 100
+    """).fetchall()
+    conn.close()
+    return {"items": [dict(row) for row in rows]}
+
+@app.get("/api/chart/{symbol}")
+async def chart(symbol: str):
+    snapshot = fetch_market_snapshot()
+    data = snapshot.get(symbol.upper())
+    if not data or "error" in data:
+        return {"symbol": symbol.upper(), "labels": [], "values": []}
+
+    return {
+        "symbol": symbol.upper(),
+        "labels": data["labels"],
+        "values": data["values"],
+    }
+
+@app.post("/api/trade_result")
+async def trade_result(payload: dict):
+    symbol = payload.get("symbol")
+    direction = payload.get("direction", "FLAT")
+    pnl = float(payload.get("pnl", 0.0))
+    score = float(payload.get("score", 0.0))
+    confidence = float(payload.get("confidence", 0.0))
+
+    risk_manager.daily_pnl += pnl
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO trade_history (symbol, direction, score, confidence, status, pnl)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (symbol, direction, score, confidence, "CLOSED", pnl))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# ----------------------------
+# app startup
+# ----------------------------
+signal_engine = SignalEngine()
+risk_manager = RiskManager()
+trade_service = TradeService = None
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
